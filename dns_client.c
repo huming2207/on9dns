@@ -6,7 +6,7 @@
 #include "lwip/netdb.h"
 #include "dns_client.h"
 
-#define DNS_SERVER_IP "8.8.8.8"
+
 #define DNS_SERVER_PORT 53
 
 // DNS header structure
@@ -41,6 +41,10 @@ void dns_client_init(dns_client_t* client)
 {
     memset(client, 0, sizeof(dns_client_t));
     client->state = DNS_STATE_IDLE;
+    client->dns_server_count = 0;
+    client->curr_dns_server_idx = 0;
+    client->curr_dns_server_retry_cnt = 0;
+    client->max_dns_server_retry_cnt = 3;
 }
 
 void dns_client_query(dns_client_t* client, const char* hostname, dns_record_type_t type, uint32_t timeout_ms)
@@ -51,6 +55,8 @@ void dns_client_query(dns_client_t* client, const char* hostname, dns_record_typ
     client->recursion_level = 0;
     client->type = type;
     client->timeout_ms = timeout_ms;
+    client->curr_dns_server_idx = 0;
+    client->curr_dns_server_retry_cnt = 0;
 }
 
 dns_client_state_t dns_client_proc(dns_client_t* client)
@@ -66,9 +72,16 @@ dns_client_state_t dns_client_proc(dns_client_t* client)
             client->recursion_level++;
             if (client->recursion_level >= DNS_CLIENT_MAX_RECURSION) {
                 client->state = DNS_STATE_ERROR;
+                close(client->sock);
             } else {
                 client->state = DNS_STATE_SENDING;
             }
+            break;
+        case DNS_STATE_IDLE:
+        case DNS_STATE_DONE:
+        case DNS_STATE_TIMEOUT:
+        case DNS_STATE_ERROR:
+            // Nothing to do
             break;
         default:
             break;
@@ -78,10 +91,17 @@ dns_client_state_t dns_client_proc(dns_client_t* client)
 
 static void dns_client_state_sending(dns_client_t* client)
 {
+    if (client->dns_server_count == 0 || client->dns_server_count > 3 || client->curr_dns_server_idx >= client->dns_server_count) {
+        client->state = DNS_STATE_ERROR;
+        close(client->sock);
+        return;
+    }
+
     // Create socket
     client->sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (client->sock < 0) {
         client->state = DNS_STATE_ERROR;
+        close(client->sock);
         return;
     }
 
@@ -95,7 +115,7 @@ static void dns_client_state_sending(dns_client_t* client)
     struct sockaddr_in dest_addr;
     dest_addr.sin_family = AF_INET;
     dest_addr.sin_port = htons(DNS_SERVER_PORT);
-    inet_pton(AF_INET, DNS_SERVER_IP, &dest_addr.sin_addr);
+    dest_addr.sin_addr.s_addr = client->dns_server[client->curr_dns_server_idx].u_addr.ip4.addr;
 
     // Construct DNS query
     uint8_t* p = client->buf;
@@ -144,19 +164,34 @@ static void dns_client_state_sending(dns_client_t* client)
 static void dns_client_state_waiting(dns_client_t* client)
 {
     const int32_t len = recv(client->sock, client->buf, sizeof(client->buf), 0);
-    close(client->sock);
 
     if (len < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            client->state = DNS_STATE_TIMEOUT;
+            client->curr_dns_server_retry_cnt++;
+            if (client->curr_dns_server_retry_cnt > client->max_dns_server_retry_cnt) {
+                client->curr_dns_server_retry_cnt = 0;
+                client->curr_dns_server_idx++;
+                if (client->curr_dns_server_idx >= client->dns_server_count) {
+                    client->state = DNS_STATE_ERROR; // All servers tried and failed
+                    close(client->sock);
+                } else {
+                    client->state = DNS_STATE_SENDING; // Move to next server
+                }
+            } else {
+                client->state = DNS_STATE_SENDING; // Retry with the same server
+            }
         } else {
             client->state = DNS_STATE_ERROR;
+            close(client->sock);
         }
         return;
     }
+    client->curr_dns_server_retry_cnt = 0;
+    client->curr_dns_server_idx = 0;
 
     if (len < sizeof(struct dns_header)) {
         client->state = DNS_STATE_ERROR;
+        close(client->sock);
         return;
     }
 
@@ -169,20 +204,23 @@ static void dns_client_state_waiting(dns_client_t* client)
     if ((ntohs(header->flags) & 0xf) != 0) {
         // Error
         client->state = DNS_STATE_ERROR;
+        close(client->sock);
         return;
     }
 
     int32_t offset = sizeof(struct dns_header);
-    char name[256];
+    char name[256] = { 0 };
 
     // Skip question section
     for (int i = 0; i < ntohs(header->qdcount); i++) {
         if (dns_parse_name(client->buf, len, &offset, name, sizeof(name)) != 0) {
             client->state = DNS_STATE_ERROR;
+            close(client->sock);
             return;
         }
         if (offset + sizeof(struct dns_question) > len) {
             client->state = DNS_STATE_ERROR;
+            close(client->sock);
             return;
         }
         offset += sizeof(struct dns_question);
@@ -192,11 +230,13 @@ static void dns_client_state_waiting(dns_client_t* client)
     for (int i = 0; i < ntohs(header->ancount); i++) {
         if (dns_parse_name(client->buf, len, &offset, name, sizeof(name)) != 0) {
             client->state = DNS_STATE_ERROR;
+            close(client->sock);
             return;
         }
 
         if (offset + sizeof(struct dns_answer) > len) {
             client->state = DNS_STATE_ERROR;
+            close(client->sock);
             return;
         }
         const struct dns_answer* answer = (struct dns_answer*)(client->buf + offset);
@@ -207,6 +247,7 @@ static void dns_client_state_waiting(dns_client_t* client)
 
         if (offset + rdlength > len) {
             client->state = DNS_STATE_ERROR;
+            close(client->sock);
             return;
         }
 
@@ -214,22 +255,26 @@ static void dns_client_state_waiting(dns_client_t* client)
             client->ip_addr.type = IPADDR_TYPE_V4;
             memcpy(&client->ip_addr.u_addr.ip4, client->buf + offset, 4);
             client->state = DNS_STATE_DONE;
+            close(client->sock);
             return;
         } else if (type == DNS_RECORD_AAAA && rdlength == 16) {
             client->ip_addr.type = IPADDR_TYPE_V6;
             memcpy(&client->ip_addr.u_addr.ip6, client->buf + offset, 16);
             client->state = DNS_STATE_DONE;
+            close(client->sock);
             return;
         } else if (type == DNS_RECORD_CNAME) {
-            char cname[256];
+            char cname[256] = { 0 };
             int32_t cname_offset = offset;
             if (dns_parse_name(client->buf, len, &cname_offset, cname, sizeof(cname)) != 0) {
                 client->state = DNS_STATE_ERROR;
+                close(client->sock);
                 return;
             }
             free(client->hostname);
             client->hostname = strdup(cname);
             client->state = DNS_STATE_CNAME;
+            close(client->sock);
             return;
         }
         offset += rdlength;

@@ -24,15 +24,20 @@ typedef enum {
 
 typedef struct {
     dns_client_state_t state;
-    int32_t sock;
+    int sock;
     uint16_t transaction_id;
     char* hostname;
-    ip_addr_t dns_server[3];
     ip_addr_t ip_addr;
     int32_t recursion_level;
     dns_record_type_t type;
     uint32_t timeout_ms;
     uint8_t buf[512];
+    // DNS server failover
+    ip_addr_t dns_server[3];
+    uint8_t dns_server_count; // Count of dns_server, no more than 3
+    uint8_t curr_dns_server_idx;
+    uint8_t curr_dns_server_retry_cnt;
+    uint8_t max_dns_server_retry_cnt;
 } dns_client_t;
 
 void dns_client_init(dns_client_t* client);
