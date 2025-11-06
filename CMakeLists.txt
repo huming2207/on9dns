@@ -1,0 +1,1 @@
+idf_component_register(SRCS "dns_client.c" INCLUDE_DIRS "." PRIV_REQUIRES "lwip")
